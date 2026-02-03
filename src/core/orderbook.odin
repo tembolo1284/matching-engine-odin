@@ -283,7 +283,7 @@ match_order :: proc(book: ^Order_Book, order: ^Order, handle: memory.Handle) -> 
 // Match a buy order against asks (ascending price order)
 match_against_asks :: proc(book: ^Order_Book, order: ^Order, handle: memory.Handle) -> u32 {
 	iterations: u32 = 0
-	max_iterations := MAX_PRICE_LEVELS * MAX_ORDERS_PER_LEVEL  // Rule 2
+	max_iterations: u32 = MAX_PRICE_LEVELS * MAX_ORDERS_PER_LEVEL  // Rule 2
 	
 	for order.remaining > 0 && book.ask_count > 0 && iterations < max_iterations {
 		iterations += 1
@@ -311,7 +311,7 @@ match_against_asks :: proc(book: ^Order_Book, order: ^Order, handle: memory.Hand
 // Match a sell order against bids (descending price order)
 match_against_bids :: proc(book: ^Order_Book, order: ^Order, handle: memory.Handle) -> u32 {
 	iterations: u32 = 0
-	max_iterations := MAX_PRICE_LEVELS * MAX_ORDERS_PER_LEVEL  // Rule 2
+	max_iterations: u32 = MAX_PRICE_LEVELS * MAX_ORDERS_PER_LEVEL  // Rule 2
 	
 	for order.remaining > 0 && book.bid_count > 0 && iterations < max_iterations {
 		iterations += 1

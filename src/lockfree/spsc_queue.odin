@@ -1,4 +1,4 @@
-package sync
+package lockfree
 
 import "core:sync"
 
