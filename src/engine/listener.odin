@@ -220,8 +220,8 @@ client_handler_thread_proc :: proc(t: ^thread.Thread) {
 			// Drain loop - wait for processor/router and send remaining output
 			for drain := 0; drain < 200; drain += 1 {
 				time.sleep(10 * time.Millisecond)
-				sent := send_pending_output(client, send_buffer[:], quiet_mode)
-				if sent == 0 && drain > 50 {
+				drain_sent := send_pending_output(client, send_buffer[:], quiet_mode)
+				if drain_sent == 0 && drain > 50 {
 					// No output for a while, probably done
 					break
 				}
