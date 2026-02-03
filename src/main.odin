@@ -2,9 +2,12 @@ package main
 
 import "core:fmt"
 import "core:os"
+import "core:net"
 import "core:thread"
 import "core:time"
 import "core:strconv"
+import "core:c/libc"
+import "base:runtime"
 
 import "types"
 import "protocol"
@@ -38,11 +41,24 @@ App :: struct {
 
 g_app: App
 
+// Signal handler
+signal_handler :: proc "c" (sig: i32) {
+	context = runtime.default_context()
+	g_app.shutdown_flag = true
+	g_app.running = false
+	// Close listener socket to unblock accept
+	net.close(g_app.listener.listen_socket)
+}
+
 main :: proc() {
 	fmt.println("╔════════════════════════════════════════╗")
 	fmt.println("║     Odin Matching Engine v1.0          ║")
 	fmt.println("╚════════════════════════════════════════╝")
 	fmt.println("")
+	
+	// Install signal handlers
+	libc.signal(libc.SIGINT, signal_handler)
+	libc.signal(libc.SIGTERM, signal_handler)
 	
 	port := parse_port()
 	
@@ -106,7 +122,7 @@ app_init :: proc(app: ^App, port: u16) -> types.Error {
 	
 	processor_config := engine.Processor_Config{
 		processor_id = 0,
-		spin_wait    = true,
+		spin_wait    = false,
 	}
 	engine.processor_init(&app.processor, processor_config, &app.book, &app.client_registry, &app.output_queue, &app.shutdown_flag)
 	
@@ -161,24 +177,38 @@ app_shutdown :: proc(app: ^App) {
 	fmt.println("")
 	fmt.println("Shutting down...")
 	
+	// Set shutdown flag
 	app.shutdown_flag = true
 	app.running = false
 	
+	// Close listener socket to unblock accept (if not already closed by signal handler)
+	net.close(app.listener.listen_socket)
+	
+	// Give threads time to notice
 	time.sleep(100 * time.Millisecond)
 	
-	if app.listener_thread != nil {
-		thread.join(app.listener_thread)
-		thread.destroy(app.listener_thread)
-	}
+	// Wait for threads
+	fmt.println("Stopping threads...")
 	
 	if app.processor_thread != nil {
 		thread.join(app.processor_thread)
 		thread.destroy(app.processor_thread)
+		app.processor_thread = nil
+		fmt.println("  ✓ Processor stopped")
 	}
 	
 	if app.router_thread != nil {
 		thread.join(app.router_thread)
 		thread.destroy(app.router_thread)
+		app.router_thread = nil
+		fmt.println("  ✓ Router stopped")
+	}
+	
+	if app.listener_thread != nil {
+		thread.join(app.listener_thread)
+		thread.destroy(app.listener_thread)
+		app.listener_thread = nil
+		fmt.println("  ✓ Listener stopped")
 	}
 	
 	print_final_stats(app)
@@ -187,8 +217,11 @@ app_shutdown :: proc(app: ^App) {
 
 print_final_stats :: proc(app: ^App) {
 	fmt.println("")
-	fmt.println("=== Final Statistics ===")
+	fmt.println("========================================")
+	fmt.println("         Server Statistics")
+	fmt.println("========================================")
 	fmt.printfln("Orders in book: %d", core.book_order_count(&app.book))
 	fmt.printfln("Best bid:       %d", core.book_best_bid(&app.book))
 	fmt.printfln("Best ask:       %d", core.book_best_ask(&app.book))
+	fmt.println("========================================")
 }

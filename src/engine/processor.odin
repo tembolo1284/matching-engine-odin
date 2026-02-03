@@ -15,6 +15,9 @@ import "../lockfree"
 PROCESSOR_SPIN_ITERATIONS :: 1000
 PROCESSOR_SLEEP_NS :: 1000
 
+// Probe symbol used for encoding detection - don't generate output for this
+PROBE_SYMBOL :: protocol.Symbol{'Z', 'P', 'R', 'O', 'B', 'E', 0, 0}
+
 Processor_Config :: struct {
 	processor_id: u32,
 	spin_wait:    bool,
@@ -39,6 +42,9 @@ Processor :: struct {
 	running:         bool,
 	output_sequence: u64,
 	stats:           Processor_Stats,
+	
+	// Track if we've seen a real (non-probe) order
+	seen_real_order: bool,
 }
 
 processor_init :: proc(
@@ -57,6 +63,13 @@ processor_init :: proc(
 	processor.running = false
 	processor.output_sequence = 0
 	processor.stats = Processor_Stats{}
+	processor.seen_real_order = false
+}
+
+// Check if symbol is the probe symbol
+@(private)
+is_probe_symbol :: proc(sym: protocol.Symbol) -> bool {
+	return sym == PROBE_SYMBOL
 }
 
 // =============================================================================
@@ -160,6 +173,13 @@ error_to_reject_reason :: proc(err: types.Error) -> protocol.Reject_Reason {
 
 @(private)
 process_new_order :: proc(processor: ^Processor, order: ^protocol.New_Order, client_id: u32) {
+	// Check if this is a probe order
+	is_probe := is_probe_symbol(order.symbol)
+	
+	if !is_probe {
+		processor.seen_real_order = true
+	}
+	
 	// Validate before sending to orderbook
 	if order.quantity == 0 {
 		reject := Output_Msg{
@@ -257,12 +277,19 @@ process_cancel :: proc(processor: ^Processor, cancel: ^protocol.Cancel_Order, cl
 
 @(private)
 process_flush :: proc(processor: ^Processor, client_id: u32) {
+	// If we haven't seen any real orders yet, this is a probe flush - skip output
+	if !processor.seen_real_order {
+		// Still cancel any orders in the book (like the probe order)
+		for order_id: u32 = 1; order_id <= 100; order_id += 1 {
+			core.book_cancel_order(processor.engine, 1, order_id)
+		}
+		return
+	}
+	
 	// FLUSH: 
 	// 1. Cancel all orders and send cancel acks
-	// 2. Then send final TOB (will be 0,0 after cancels)
+	// 2. Then send final TOB
 	
-	// Cancel orders for user 1 with order_ids 1-100
-	// (In production, we'd iterate the order book properly)
 	for order_id: u32 = 1; order_id <= 100; order_id += 1 {
 		err := core.book_cancel_order(processor.engine, 1, order_id)
 		if err == .None {

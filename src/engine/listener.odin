@@ -72,6 +72,9 @@ listener_thread_proc :: proc(t: ^thread.Thread) {
 	
 	fmt.printfln("[Listener] Started on port %d", listener.config.port)
 	
+	// Set a timeout so accept doesn't block forever
+	net.set_option(listener.listen_socket, .Receive_Timeout, time.Duration(500 * time.Millisecond))
+	
 	for !listener.shutdown_flag^ {
 		client_socket, client_endpoint, err := net.accept_tcp(listener.listen_socket)
 		
@@ -79,7 +82,6 @@ listener_thread_proc :: proc(t: ^thread.Thread) {
 			if listener.shutdown_flag^ {
 				break
 			}
-			time.sleep(10 * time.Millisecond)
 			continue
 		}
 		
@@ -99,7 +101,6 @@ listener_thread_proc :: proc(t: ^thread.Thread) {
 		
 		listener.connections_accepted += 1
 		
-		// Spawn handler
 		ctx := new(Client_Handler_Context)
 		ctx.client_registry = listener.client_registry
 		ctx.client_id = client_id
@@ -118,7 +119,6 @@ listener_thread_proc :: proc(t: ^thread.Thread) {
 		thread.start(handler)
 	}
 	
-	net.close(listener.listen_socket)
 	fmt.println("[Listener] Stopped")
 	fmt.printfln("[Listener] Accepted: %d, Rejected: %d",
 		listener.connections_accepted, listener.connections_rejected)
@@ -128,7 +128,6 @@ listener_thread_proc :: proc(t: ^thread.Thread) {
 // Client Handler Thread
 // =============================================================================
 
-// Length prefix size (4 bytes, big-endian)
 FRAME_HEADER_SIZE :: 4
 
 client_handler_thread_proc :: proc(t: ^thread.Thread) {
@@ -143,7 +142,6 @@ client_handler_thread_proc :: proc(t: ^thread.Thread) {
 	quiet_mode := ctx.quiet_mode
 	shutdown_flag := ctx.shutdown_flag
 	
-	// Free context early - we've copied what we need
 	free(ctx)
 	
 	client := registry_get_client(registry, client_id)
@@ -156,71 +154,101 @@ client_handler_thread_proc :: proc(t: ^thread.Thread) {
 		fmt.printfln("[Handler %d] Started", client_id)
 	}
 	
-	// Send welcome/probe response with length prefix
-	// Frame: length(4) + magic(1) + type(1) = 6 bytes total
+	// Send welcome
 	welcome_buf: [6]u8
-	welcome_buf[0] = 0x00  // Length = 2 (big-endian)
+	welcome_buf[0] = 0x00
 	welcome_buf[1] = 0x00
 	welcome_buf[2] = 0x00
 	welcome_buf[3] = 0x02
-	welcome_buf[4] = protocol.MAGIC      // 0x4D 'M'
-	welcome_buf[5] = protocol.MSG_FLUSH  // 0x46 'F'
+	welcome_buf[4] = protocol.MAGIC
+	welcome_buf[5] = protocol.MSG_FLUSH
 	
 	if !quiet_mode {
-		fmt.printfln("[Handler %d] Sending welcome with frame header", client_id)
+		fmt.printfln("[Handler %d] Sending welcome", client_id)
 	}
 	
-	sent_bytes, welcome_err := net.send_tcp(client.socket, welcome_buf[:])
+	_, welcome_err := net.send_tcp(client.socket, welcome_buf[:])
 	if welcome_err != nil {
 		fmt.eprintfln("[Handler %d] Failed to send welcome: %v", client_id, welcome_err)
 		registry_remove_client(registry, client_id)
 		return
 	}
 	
-	if !quiet_mode {
-		fmt.printfln("[Handler %d] Sent welcome (%d bytes)", client_id, sent_bytes)
-	}
-	
 	recv_buffer: [4096]u8
 	buffer_used := 0
 	send_buffer: [4096]u8
+	last_message_time := time.now()
 	
+	// Main loop
 	for !shutdown_flag^ && client.state == .Connected {
-		// Receive
-		bytes_read := receive_data(client, recv_buffer[buffer_used:])
+		// Always try to send pending output first
+		sent := send_pending_output(client, send_buffer[:], quiet_mode)
+		if sent > 0 {
+			last_message_time = time.now()
+		}
 		
-		if bytes_read < 0 {
+		// Try to receive with timeout
+		net.set_option(client.socket, .Receive_Timeout, time.Duration(50 * time.Millisecond))
+		bytes, recv_err := net.recv_tcp(client.socket, recv_buffer[buffer_used:])
+		
+		if recv_err != nil {
+			// Could be timeout or actual error
+			// Check if we have pending output to send
+			if client_has_pending_output(client) {
+				continue
+			}
+			
+			// Check how long since last activity
+			elapsed := time.duration_seconds(time.diff(last_message_time, time.now()))
+			if elapsed > 2.0 {
+				// Timeout with no activity - client probably gone
+				if !quiet_mode {
+					fmt.printfln("[Handler %d] Timeout, disconnecting", client_id)
+				}
+				break
+			}
+			continue
+		}
+		
+		if bytes == 0 {
+			// Client closed connection gracefully
+			// But we need to wait for any final output (like FLUSH responses)
+			if !quiet_mode {
+				fmt.printfln("[Handler %d] Client closed connection, draining output...", client_id)
+			}
+			
+			// Drain loop - wait for processor/router and send remaining output
+			for drain := 0; drain < 200; drain += 1 {
+				time.sleep(10 * time.Millisecond)
+				sent := send_pending_output(client, send_buffer[:], quiet_mode)
+				if sent == 0 && drain > 50 {
+					// No output for a while, probably done
+					break
+				}
+			}
 			break
 		}
 		
-		if bytes_read > 0 {
-			buffer_used += bytes_read
-			client_add_bytes_received(client, u64(bytes_read))
-			
-			if !quiet_mode {
-				fmt.printfln("[Handler %d] Received %d bytes (buffer: %d)", 
-					client_id, bytes_read, buffer_used)
-			}
-			
-			// Process length-prefixed binary messages
-			processed := process_framed_messages(client, recv_buffer[:buffer_used], quiet_mode)
-			
-			// Compact buffer
-			if processed > 0 {
-				if processed < buffer_used {
-					for i := 0; i < buffer_used - processed; i += 1 {
-						recv_buffer[i] = recv_buffer[processed + i]
-					}
-				}
-				buffer_used -= processed
-			}
+		// Got data
+		buffer_used += bytes
+		client_add_bytes_received(client, u64(bytes))
+		last_message_time = time.now()
+		
+		if !quiet_mode {
+			fmt.printfln("[Handler %d] Received %d bytes (buffer: %d)", client_id, bytes, buffer_used)
 		}
 		
-		// Send pending output
-		send_pending_output(client, send_buffer[:])
+		// Process messages
+		processed := process_framed_messages(client, recv_buffer[:buffer_used], quiet_mode)
 		
-		if bytes_read == 0 && !client_has_pending_output(client) {
-			time.sleep(100 * time.Microsecond)
+		// Compact buffer
+		if processed > 0 && processed < buffer_used {
+			for i := 0; i < buffer_used - processed; i += 1 {
+				recv_buffer[i] = recv_buffer[processed + i]
+			}
+		}
+		if processed > 0 {
+			buffer_used -= processed
 		}
 	}
 	
@@ -233,35 +261,14 @@ client_handler_thread_proc :: proc(t: ^thread.Thread) {
 }
 
 // =============================================================================
-// Receive Helpers
+// Framing Helpers
 // =============================================================================
 
-@(private)
-receive_data :: proc(client: ^Client, buffer: []u8) -> int {
-	if len(buffer) == 0 {
-		return 0
-	}
-	
-	bytes, err := net.recv_tcp(client.socket, buffer)
-	
-	if err != nil {
-		return -1
-	}
-	
-	if bytes == 0 {
-		return -1
-	}
-	
-	return bytes
-}
-
-// Read 4-byte big-endian length
 @(private)
 read_frame_length :: proc(data: []u8) -> u32 {
 	return u32(data[0]) << 24 | u32(data[1]) << 16 | u32(data[2]) << 8 | u32(data[3])
 }
 
-// Process messages with 4-byte length prefix framing
 @(private)
 process_framed_messages :: proc(client: ^Client, data: []u8, quiet_mode: bool) -> int {
 	processed := 0
@@ -269,37 +276,26 @@ process_framed_messages :: proc(client: ^Client, data: []u8, quiet_mode: bool) -
 	for processed < len(data) {
 		remaining := data[processed:]
 		
-		// Need at least frame header (4 bytes)
 		if len(remaining) < FRAME_HEADER_SIZE {
 			break
 		}
 		
-		// Read message length from frame header
 		msg_len := int(read_frame_length(remaining))
 		
 		if !quiet_mode {
 			fmt.printfln("[Handler %d] Frame length: %d", client.client_id, msg_len)
 		}
 		
-		// Sanity check on length
 		if msg_len <= 0 || msg_len > 1024 {
-			fmt.printfln("[Handler %d] Invalid frame length: %d, skipping byte", 
-				client.client_id, msg_len)
 			processed += 1
 			continue
 		}
 		
-		// Wait for complete frame (header + payload)
 		total_frame_size := FRAME_HEADER_SIZE + msg_len
 		if len(remaining) < total_frame_size {
-			if !quiet_mode {
-				fmt.printfln("[Handler %d] Incomplete frame, have %d need %d", 
-					client.client_id, len(remaining), total_frame_size)
-			}
 			break
 		}
 		
-		// Extract message payload (skip frame header)
 		msg_data := remaining[FRAME_HEADER_SIZE:total_frame_size]
 		
 		if !quiet_mode {
@@ -310,27 +306,20 @@ process_framed_messages :: proc(client: ^Client, data: []u8, quiet_mode: bool) -
 			fmt.println("")
 		}
 		
-		// Process the binary message
 		process_binary_message(client, msg_data, quiet_mode)
-		
 		processed += total_frame_size
 	}
 	
 	return processed
 }
 
-// Process a single binary message (without frame header)
 @(private)
 process_binary_message :: proc(client: ^Client, data: []u8, quiet_mode: bool) {
 	if len(data) < protocol.HEADER_SIZE {
-		fmt.printfln("[Handler %d] Message too short: %d bytes", client.client_id, len(data))
 		return
 	}
 	
-	// Check magic byte
 	if data[0] != protocol.MAGIC {
-		fmt.printfln("[Handler %d] Bad magic: 0x%02X (expected 0x%02X)", 
-			client.client_id, data[0], protocol.MAGIC)
 		return
 	}
 	
@@ -338,25 +327,19 @@ process_binary_message :: proc(client: ^Client, data: []u8, quiet_mode: bool) {
 	expected_size := protocol.get_message_size(msg_type)
 	
 	if !quiet_mode {
-		fmt.printfln("[Handler %d] Msg type: '%c' (0x%02X), expected size: %d, actual: %d", 
+		fmt.printfln("[Handler %d] Msg type: '%c' (0x%02X), expected: %d, actual: %d", 
 			client.client_id, msg_type, msg_type, expected_size, len(data))
 	}
 	
-	if expected_size < 0 {
-		fmt.printfln("[Handler %d] Unknown message type: 0x%02X", client.client_id, msg_type)
+	if expected_size < 0 || len(data) < expected_size {
 		return
 	}
 	
-	if len(data) < expected_size {
-		fmt.printfln("[Handler %d] Message too short for type", client.client_id)
-		return
-	}
-	
-	// Decode and enqueue
 	result, err := protocol.decode_input(data[:expected_size])
 	if err == .None {
 		if !quiet_mode {
-			if result.msg_type == protocol.MSG_NEW_ORDER {
+			switch result.msg_type {
+			case protocol.MSG_NEW_ORDER:
 				fmt.printfln("[Handler %d] Decoded NEW_ORDER: user=%d, order=%d, price=%d, qty=%d, side=%c",
 					client.client_id,
 					result.new_order.user_id,
@@ -364,12 +347,10 @@ process_binary_message :: proc(client: ^Client, data: []u8, quiet_mode: bool) {
 					result.new_order.price,
 					result.new_order.quantity,
 					u8(result.new_order.side))
-			} else if result.msg_type == protocol.MSG_CANCEL {
+			case protocol.MSG_CANCEL:
 				fmt.printfln("[Handler %d] Decoded CANCEL: user=%d, order=%d",
-					client.client_id,
-					result.cancel.user_id,
-					result.cancel.user_order_id)
-			} else if result.msg_type == protocol.MSG_FLUSH {
+					client.client_id, result.cancel.user_id, result.cancel.user_order_id)
+			case protocol.MSG_FLUSH:
 				fmt.printfln("[Handler %d] Decoded FLUSH", client.client_id)
 			}
 		}
@@ -380,11 +361,7 @@ process_binary_message :: proc(client: ^Client, data: []u8, quiet_mode: bool) {
 			if !quiet_mode {
 				fmt.printfln("[Handler %d] Enqueued message", client.client_id)
 			}
-		} else {
-			fmt.printfln("[Handler %d] Failed to enqueue message", client.client_id)
 		}
-	} else {
-		fmt.printfln("[Handler %d] Decode error: %v", client.client_id, err)
 	}
 }
 
@@ -414,22 +391,20 @@ create_input_envelope :: proc(result: ^protocol.Input_Decode_Result, client_id: 
 // =============================================================================
 
 @(private)
-send_pending_output :: proc(client: ^Client, send_buffer: []u8) {
-	MAX_SEND_BATCH :: 10
+send_pending_output :: proc(client: ^Client, send_buffer: []u8, quiet_mode: bool) -> int {
+	sent_count := 0
 	
-	for i := 0; i < MAX_SEND_BATCH; i += 1 {
+	for i := 0; i < 100; i += 1 {
 		msg: Output_Msg
 		if !client_dequeue_output(client, &msg) {
 			break
 		}
 		
-		// Encode message starting after frame header
 		bytes_written := encode_output_msg(&msg, send_buffer[FRAME_HEADER_SIZE:])
 		if bytes_written <= 0 {
 			continue
 		}
 		
-		// Write frame header (4-byte big-endian length)
 		send_buffer[0] = u8(bytes_written >> 24)
 		send_buffer[1] = u8(bytes_written >> 16)
 		send_buffer[2] = u8(bytes_written >> 8)
@@ -437,18 +412,38 @@ send_pending_output :: proc(client: ^Client, send_buffer: []u8) {
 		
 		total_frame_size := FRAME_HEADER_SIZE + bytes_written
 		
+		if !quiet_mode {
+			fmt.printfln("[Handler %d] Sending %s (%d bytes)", 
+				client.client_id, msg_type_str(msg.msg_type), total_frame_size)
+		}
+		
 		total_sent := 0
 		for total_sent < total_frame_size {
 			sent, err := net.send_tcp(client.socket, send_buffer[total_sent:total_frame_size])
 			if err != nil {
-				return
+				return sent_count
 			}
 			total_sent += sent
 		}
 		
 		client_add_bytes_sent(client, u64(total_frame_size))
 		client_inc_sent(client)
+		sent_count += 1
 	}
+	
+	return sent_count
+}
+
+@(private)
+msg_type_str :: proc(t: Output_Msg_Type) -> string {
+	switch t {
+	case .Ack:         return "ACK"
+	case .Cancel_Ack:  return "CANCEL_ACK"
+	case .Trade:       return "TRADE"
+	case .Top_Of_Book: return "TOB"
+	case .Reject:      return "REJECT"
+	}
+	return "?"
 }
 
 @(private)
