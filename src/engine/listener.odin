@@ -6,7 +6,6 @@ import "core:thread"
 import "core:time"
 import "../types"
 import "../protocol"
-import "../lockfree"
 
 // =============================================================================
 // TCP Listener
@@ -74,7 +73,7 @@ listener_thread_proc :: proc(t: ^thread.Thread) {
 	fmt.printfln("[Listener] Started on port %d", listener.config.port)
 	
 	for !listener.shutdown_flag^ {
-		client_socket, client_endpoint, err := net.accept(listener.listen_socket)
+		client_socket, client_endpoint, err := net.accept_tcp(listener.listen_socket)
 		
 		if err != nil {
 			if listener.shutdown_flag^ {
@@ -210,7 +209,7 @@ receive_data :: proc(client: ^Client, buffer: []u8) -> int {
 		return 0
 	}
 	
-	bytes, err := net.recv(client.socket, buffer)
+	bytes, err := net.recv_tcp(client.socket, buffer)
 	
 	if err != nil {
 		return -1
@@ -326,7 +325,7 @@ send_pending_output :: proc(client: ^Client, send_buffer: []u8) {
 		
 		total_sent := 0
 		for total_sent < bytes_written {
-			sent, err := net.send(client.socket, send_buffer[total_sent:bytes_written])
+			sent, err := net.send_tcp(client.socket, send_buffer[total_sent:bytes_written])
 			if err != nil {
 				return
 			}

@@ -30,8 +30,9 @@ Client :: struct {
 	protocol:       Client_Protocol,
 	handler_thread: ^thread.Thread,
 	
-	input_queue:    Input_Queue,
-	output_queue:   Client_Output_Queue,
+	// Heap-allocated queues (allocated on connect, freed on disconnect)
+	input_queue:    ^Input_Queue,
+	output_queue:   ^Client_Output_Queue,
 	
 	messages_received: u64,
 	messages_sent:     u64,
@@ -58,6 +59,8 @@ registry_init :: proc(registry: ^Client_Registry) {
 		registry.clients[i].client_id = 0
 		registry.clients[i].state = .Inactive
 		registry.clients[i].handler_thread = nil
+		registry.clients[i].input_queue = nil
+		registry.clients[i].output_queue = nil
 	}
 }
 
@@ -69,6 +72,15 @@ registry_destroy :: proc(registry: ^Client_Registry) {
 		client := &registry.clients[i]
 		if client.state != .Inactive {
 			net.close(client.socket)
+			// Free heap-allocated queues
+			if client.input_queue != nil {
+				free(client.input_queue)
+				client.input_queue = nil
+			}
+			if client.output_queue != nil {
+				free(client.output_queue)
+				client.output_queue = nil
+			}
 			client.state = .Inactive
 			client.client_id = 0
 		}
@@ -93,8 +105,26 @@ registry_add_client :: proc(registry: ^Client_Registry, socket: net.TCP_Socket) 
 			client.protocol = .Unknown
 			client.handler_thread = nil
 			
-			lockfree.spsc_init(&client.input_queue)
-			lockfree.spsc_init(&client.output_queue)
+			// Allocate queues on heap (Rule 3: allocation at init only)
+			client.input_queue = new(Input_Queue)
+			client.output_queue = new(Client_Output_Queue)
+			
+			if client.input_queue == nil || client.output_queue == nil {
+				// Allocation failed - cleanup and reject
+				if client.input_queue != nil {
+					free(client.input_queue)
+				}
+				if client.output_queue != nil {
+					free(client.output_queue)
+				}
+				client.input_queue = nil
+				client.output_queue = nil
+				client.state = .Inactive
+				return 0
+			}
+			
+			lockfree.spsc_init(client.input_queue)
+			lockfree.spsc_init(client.output_queue)
 			
 			client.messages_received = 0
 			client.messages_sent = 0
@@ -122,6 +152,17 @@ registry_remove_client :: proc(registry: ^Client_Registry, client_id: u32) {
 	}
 	
 	net.close(client.socket)
+	
+	// Free heap-allocated queues
+	if client.input_queue != nil {
+		free(client.input_queue)
+		client.input_queue = nil
+	}
+	if client.output_queue != nil {
+		free(client.output_queue)
+		client.output_queue = nil
+	}
+	
 	client.state = .Inactive
 	client.client_id = 0
 	
@@ -156,45 +197,45 @@ registry_get_all_clients :: proc(registry: ^Client_Registry) -> []Client {
 // =============================================================================
 
 client_enqueue_input :: proc(client: ^Client, envelope: ^Input_Envelope) -> bool {
-	if client == nil || client.state != .Connected {
+	if client == nil || client.state != .Connected || client.input_queue == nil {
 		return false
 	}
-	return lockfree.spsc_enqueue(&client.input_queue, envelope)
+	return lockfree.spsc_enqueue(client.input_queue, envelope)
 }
 
 client_dequeue_input :: proc(client: ^Client, envelope: ^Input_Envelope) -> bool {
-	if client == nil {
+	if client == nil || client.input_queue == nil {
 		return false
 	}
-	return lockfree.spsc_dequeue(&client.input_queue, envelope)
+	return lockfree.spsc_dequeue(client.input_queue, envelope)
 }
 
 client_dequeue_input_batch :: proc(client: ^Client, envelopes: []Input_Envelope, max_items: u32) -> u32 {
-	if client == nil {
+	if client == nil || client.input_queue == nil {
 		return 0
 	}
-	return lockfree.spsc_dequeue_batch(&client.input_queue, envelopes, max_items)
+	return lockfree.spsc_dequeue_batch(client.input_queue, envelopes, max_items)
 }
 
 client_enqueue_output :: proc(client: ^Client, msg: ^Output_Msg) -> bool {
-	if client == nil || client.state == .Inactive {
+	if client == nil || client.state == .Inactive || client.output_queue == nil {
 		return false
 	}
-	return lockfree.spsc_enqueue(&client.output_queue, msg)
+	return lockfree.spsc_enqueue(client.output_queue, msg)
 }
 
 client_dequeue_output :: proc(client: ^Client, msg: ^Output_Msg) -> bool {
-	if client == nil {
+	if client == nil || client.output_queue == nil {
 		return false
 	}
-	return lockfree.spsc_dequeue(&client.output_queue, msg)
+	return lockfree.spsc_dequeue(client.output_queue, msg)
 }
 
 client_has_pending_output :: proc(client: ^Client) -> bool {
-	if client == nil {
+	if client == nil || client.output_queue == nil {
 		return false
 	}
-	return !lockfree.spsc_is_empty(&client.output_queue)
+	return !lockfree.spsc_is_empty(client.output_queue)
 }
 
 // =============================================================================
