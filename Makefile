@@ -55,20 +55,20 @@ build-aggressive:
 	@echo "✓ $(OUT_DIR)/$(PROJECT)_aggressive"
 
 # ════════════════════════════════════════════════════════════════════════════════
-# Run
+# Run (using exec for proper signal handling)
 # ════════════════════════════════════════════════════════════════════════════════
 
 run: build
 	@echo ""
-	@./$(OUT_DIR)/$(PROJECT) $(TCP_PORT)
+	@exec ./$(OUT_DIR)/$(PROJECT) $(TCP_PORT)
 
 run-release: build-release
 	@echo ""
-	@./$(OUT_DIR)/$(PROJECT)_release $(TCP_PORT)
+	@exec ./$(OUT_DIR)/$(PROJECT)_release $(TCP_PORT)
 
 run-aggressive: build-aggressive
 	@echo ""
-	@./$(OUT_DIR)/$(PROJECT)_aggressive $(TCP_PORT)
+	@exec ./$(OUT_DIR)/$(PROJECT)_aggressive $(TCP_PORT)
 
 # ════════════════════════════════════════════════════════════════════════════════
 # Test & Clean

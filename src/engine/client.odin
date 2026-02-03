@@ -17,17 +17,10 @@ Client_State :: enum u8 {
 	Draining,
 }
 
-Client_Protocol :: enum u8 {
-	Unknown,
-	Binary,
-	CSV,
-}
-
 Client :: struct {
 	socket:         net.TCP_Socket,
 	client_id:      u32,
 	state:          Client_State,
-	protocol:       Client_Protocol,
 	handler_thread: ^thread.Thread,
 	
 	// Heap-allocated queues (allocated on connect, freed on disconnect)
@@ -71,18 +64,19 @@ registry_destroy :: proc(registry: ^Client_Registry) {
 	for i := 0; i < MAX_CLIENTS; i += 1 {
 		client := &registry.clients[i]
 		if client.state != .Inactive {
+			// Close socket first
 			net.close(client.socket)
-			// Free heap-allocated queues
-			if client.input_queue != nil {
-				free(client.input_queue)
-				client.input_queue = nil
-			}
-			if client.output_queue != nil {
-				free(client.output_queue)
-				client.output_queue = nil
-			}
 			client.state = .Inactive
 			client.client_id = 0
+		}
+		// Free queues regardless of state (they might have been allocated)
+		if client.input_queue != nil {
+			free(client.input_queue)
+			client.input_queue = nil
+		}
+		if client.output_queue != nil {
+			free(client.output_queue)
+			client.output_queue = nil
 		}
 	}
 	registry.active_count = 0
@@ -102,7 +96,6 @@ registry_add_client :: proc(registry: ^Client_Registry, socket: net.TCP_Socket) 
 			client.socket = socket
 			client.client_id = u32(i + 1)
 			client.state = .Connected
-			client.protocol = .Unknown
 			client.handler_thread = nil
 			
 			// Allocate queues on heap (Rule 3: allocation at init only)
@@ -110,7 +103,6 @@ registry_add_client :: proc(registry: ^Client_Registry, socket: net.TCP_Socket) 
 			client.output_queue = new(Client_Output_Queue)
 			
 			if client.input_queue == nil || client.output_queue == nil {
-				// Allocation failed - cleanup and reject
 				if client.input_queue != nil {
 					free(client.input_queue)
 				}
@@ -151,6 +143,10 @@ registry_remove_client :: proc(registry: ^Client_Registry, client_id: u32) {
 		return
 	}
 	
+	// Mark as inactive first to prevent further access
+	client.state = .Inactive
+	
+	// Close socket
 	net.close(client.socket)
 	
 	// Free heap-allocated queues
@@ -163,7 +159,6 @@ registry_remove_client :: proc(registry: ^Client_Registry, client_id: u32) {
 		client.output_queue = nil
 	}
 	
-	client.state = .Inactive
 	client.client_id = 0
 	
 	if registry.active_count > 0 {
@@ -193,11 +188,17 @@ registry_get_all_clients :: proc(registry: ^Client_Registry) -> []Client {
 }
 
 // =============================================================================
-// Client Queue Operations
+// Client Queue Operations (with nil checks)
 // =============================================================================
 
 client_enqueue_input :: proc(client: ^Client, envelope: ^Input_Envelope) -> bool {
-	if client == nil || client.state != .Connected || client.input_queue == nil {
+	if client == nil {
+		return false
+	}
+	if client.state != .Connected {
+		return false
+	}
+	if client.input_queue == nil {
 		return false
 	}
 	return lockfree.spsc_enqueue(client.input_queue, envelope)
@@ -218,7 +219,13 @@ client_dequeue_input_batch :: proc(client: ^Client, envelopes: []Input_Envelope,
 }
 
 client_enqueue_output :: proc(client: ^Client, msg: ^Output_Msg) -> bool {
-	if client == nil || client.state == .Inactive || client.output_queue == nil {
+	if client == nil {
+		return false
+	}
+	if client.state == .Inactive {
+		return false
+	}
+	if client.output_queue == nil {
 		return false
 	}
 	return lockfree.spsc_enqueue(client.output_queue, msg)

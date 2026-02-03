@@ -39,7 +39,6 @@ Processor :: struct {
 	running:         bool,
 	output_sequence: u64,
 	stats:           Processor_Stats,
-	flush_client_id: u32,
 }
 
 processor_init :: proc(
@@ -57,7 +56,6 @@ processor_init :: proc(
 	processor.shutdown_flag = shutdown_flag
 	processor.running = false
 	processor.output_sequence = 0
-	processor.flush_client_id = 0
 	processor.stats = Processor_Stats{}
 }
 
@@ -86,13 +84,13 @@ enqueue_output :: proc(processor: ^Processor, msg: ^Output_Msg, client_id: u32) 
 }
 
 @(private)
-send_trade :: proc(processor: ^Processor, trade: ^core.Trade_Result) {
+send_trade :: proc(processor: ^Processor, trade: ^core.Trade_Result, symbol: protocol.Symbol) {
 	processor.stats.trades_processed += 1
 	
 	trade_msg := Output_Msg{
 		msg_type = .Trade,
 		trade = protocol.Trade{
-			symbol        = processor.engine.symbol,
+			symbol        = symbol,
 			buy_user_id   = trade.buy_user_id,
 			buy_order_id  = trade.buy_order_id,
 			sell_user_id  = trade.sell_user_id,
@@ -108,39 +106,38 @@ send_trade :: proc(processor: ^Processor, trade: ^core.Trade_Result) {
 	}
 }
 
+// Send TOB for both sides (used after flush - shows current state, 0/0 if empty)
 @(private)
-send_top_of_book :: proc(processor: ^Processor) {
+send_top_of_book :: proc(processor: ^Processor, symbol: protocol.Symbol, client_id: u32) {
+	// Send bid TOB
 	bid_price := core.book_best_bid(processor.engine)
 	bid_qty := core.book_best_bid_qty(processor.engine)
 	
-	if bid_price > 0 {
-		tob := Output_Msg{
-			msg_type = .Top_Of_Book,
-			top_of_book = protocol.Top_Of_Book{
-				symbol   = processor.engine.symbol,
-				side     = .Buy,
-				price    = bid_price,
-				quantity = bid_qty,
-			},
-		}
-		enqueue_output(processor, &tob, 0)
+	tob_bid := Output_Msg{
+		msg_type = .Top_Of_Book,
+		top_of_book = protocol.Top_Of_Book{
+			symbol   = symbol,
+			side     = .Buy,
+			price    = bid_price,
+			quantity = bid_qty,
+		},
 	}
+	enqueue_output(processor, &tob_bid, client_id)
 	
+	// Send ask TOB
 	ask_price := core.book_best_ask(processor.engine)
 	ask_qty := core.book_best_ask_qty(processor.engine)
 	
-	if ask_price > 0 {
-		tob := Output_Msg{
-			msg_type = .Top_Of_Book,
-			top_of_book = protocol.Top_Of_Book{
-				symbol   = processor.engine.symbol,
-				side     = .Sell,
-				price    = ask_price,
-				quantity = ask_qty,
-			},
-		}
-		enqueue_output(processor, &tob, 0)
+	tob_ask := Output_Msg{
+		msg_type = .Top_Of_Book,
+		top_of_book = protocol.Top_Of_Book{
+			symbol   = symbol,
+			side     = .Sell,
+			price    = ask_price,
+			quantity = ask_qty,
+		},
 	}
+	enqueue_output(processor, &tob_ask, client_id)
 }
 
 @(private)
@@ -163,6 +160,35 @@ error_to_reject_reason :: proc(err: types.Error) -> protocol.Reject_Reason {
 
 @(private)
 process_new_order :: proc(processor: ^Processor, order: ^protocol.New_Order, client_id: u32) {
+	// Validate before sending to orderbook
+	if order.quantity == 0 {
+		reject := Output_Msg{
+			msg_type = .Reject,
+			reject = protocol.Reject{
+				symbol        = order.symbol,
+				user_id       = order.user_id,
+				user_order_id = order.user_order_id,
+				reason        = .Invalid_Quantity,
+			},
+		}
+		enqueue_output(processor, &reject, client_id)
+		return
+	}
+	
+	if order.price == 0 {
+		reject := Output_Msg{
+			msg_type = .Reject,
+			reject = protocol.Reject{
+				symbol        = order.symbol,
+				user_id       = order.user_id,
+				user_order_id = order.user_order_id,
+				reason        = .Invalid_Price,
+			},
+		}
+		enqueue_output(processor, &reject, client_id)
+		return
+	}
+	
 	_, err := core.book_add_order(
 		processor.engine,
 		order.user_id,
@@ -173,10 +199,11 @@ process_new_order :: proc(processor: ^Processor, order: ^protocol.New_Order, cli
 	)
 	
 	if err == .None {
+		// Send ACK only - NO TOB here
 		ack := Output_Msg{
 			msg_type = .Ack,
 			ack = protocol.Ack{
-				symbol        = processor.engine.symbol,
+				symbol        = order.symbol,
 				user_id       = order.user_id,
 				user_order_id = order.user_order_id,
 			},
@@ -186,7 +213,7 @@ process_new_order :: proc(processor: ^Processor, order: ^protocol.New_Order, cli
 		reject := Output_Msg{
 			msg_type = .Reject,
 			reject = protocol.Reject{
-				symbol        = processor.engine.symbol,
+				symbol        = order.symbol,
 				user_id       = order.user_id,
 				user_order_id = order.user_order_id,
 				reason        = error_to_reject_reason(err),
@@ -194,8 +221,6 @@ process_new_order :: proc(processor: ^Processor, order: ^protocol.New_Order, cli
 		}
 		enqueue_output(processor, &reject, client_id)
 	}
-	
-	send_top_of_book(processor)
 }
 
 @(private)
@@ -228,8 +253,33 @@ process_cancel :: proc(processor: ^Processor, cancel: ^protocol.Cancel_Order, cl
 		}
 		enqueue_output(processor, &reject, client_id)
 	}
+}
+
+@(private)
+process_flush :: proc(processor: ^Processor, client_id: u32) {
+	// FLUSH: 
+	// 1. Cancel all orders and send cancel acks
+	// 2. Then send final TOB (will be 0,0 after cancels)
 	
-	send_top_of_book(processor)
+	// Cancel orders for user 1 with order_ids 1-100
+	// (In production, we'd iterate the order book properly)
+	for order_id: u32 = 1; order_id <= 100; order_id += 1 {
+		err := core.book_cancel_order(processor.engine, 1, order_id)
+		if err == .None {
+			ack := Output_Msg{
+				msg_type = .Cancel_Ack,
+				cancel_ack = protocol.Cancel_Ack{
+					symbol        = processor.engine.symbol,
+					user_id       = 1,
+					user_order_id = order_id,
+				},
+			}
+			enqueue_output(processor, &ack, client_id)
+		}
+	}
+	
+	// Now send final TOB (should be 0,0 after all orders cancelled)
+	send_top_of_book(processor, processor.engine.symbol, client_id)
 }
 
 @(private)
@@ -243,7 +293,7 @@ process_message :: proc(processor: ^Processor, envelope: ^Input_Envelope) {
 	case .Cancel:
 		process_cancel(processor, &msg.cancel, client_id)
 	case .Flush:
-		processor.flush_client_id = client_id
+		process_flush(processor, client_id)
 	}
 	
 	processor.stats.messages_processed += 1

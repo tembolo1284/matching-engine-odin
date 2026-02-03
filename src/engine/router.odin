@@ -49,12 +49,32 @@ router_init :: proc(
 // =============================================================================
 
 @(private)
+msg_type_name :: proc(msg_type: Output_Msg_Type) -> string {
+	switch msg_type {
+	case .Ack:         return "ACK"
+	case .Cancel_Ack:  return "CANCEL_ACK"
+	case .Trade:       return "TRADE"
+	case .Top_Of_Book: return "TOB"
+	case .Reject:      return "REJECT"
+	}
+	return "UNKNOWN"
+}
+
+@(private)
 route_to_client :: proc(router: ^Router, msg: ^Output_Msg, client_id: u32) -> bool {
 	client := registry_get_client(router.client_registry, client_id)
 	if client == nil {
+		fmt.printfln("[Router] Client %d not found, dropping %s", client_id, msg_type_name(msg.msg_type))
 		return false
 	}
-	return client_enqueue_output(client, msg)
+	
+	if client_enqueue_output(client, msg) {
+		fmt.printfln("[Router] Routed %s to client %d", msg_type_name(msg.msg_type), client_id)
+		return true
+	} else {
+		fmt.printfln("[Router] Queue full for client %d, dropping %s", client_id, msg_type_name(msg.msg_type))
+		return false
+	}
 }
 
 @(private)
@@ -68,6 +88,7 @@ broadcast_message :: proc(router: ^Router, msg: ^Output_Msg) -> bool {
 			continue
 		}
 		if client_enqueue_output(client, msg) {
+			fmt.printfln("[Router] Broadcast %s to client %d", msg_type_name(msg.msg_type), client.client_id)
 			success = true
 		}
 	}
