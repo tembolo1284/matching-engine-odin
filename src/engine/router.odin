@@ -13,7 +13,8 @@ ROUTER_SLEEP_NS :: 1000
 MAX_OUTPUT_QUEUES :: 2
 
 Router_Config :: struct {
-	tcp_mode: bool,
+	tcp_mode:   bool,
+	quiet_mode: bool,
 }
 
 Router :: struct {
@@ -49,32 +50,13 @@ router_init :: proc(
 // =============================================================================
 
 @(private)
-msg_type_name :: proc(msg_type: Output_Msg_Type) -> string {
-	switch msg_type {
-	case .Ack:         return "ACK"
-	case .Cancel_Ack:  return "CANCEL_ACK"
-	case .Trade:       return "TRADE"
-	case .Top_Of_Book: return "TOB"
-	case .Reject:      return "REJECT"
-	}
-	return "UNKNOWN"
-}
-
-@(private)
 route_to_client :: proc(router: ^Router, msg: ^Output_Msg, client_id: u32) -> bool {
 	client := registry_get_client(router.client_registry, client_id)
 	if client == nil {
-		fmt.printfln("[Router] Client %d not found, dropping %s", client_id, msg_type_name(msg.msg_type))
 		return false
 	}
 	
-	if client_enqueue_output(client, msg) {
-		fmt.printfln("[Router] Routed %s to client %d", msg_type_name(msg.msg_type), client_id)
-		return true
-	} else {
-		fmt.printfln("[Router] Queue full for client %d, dropping %s", client_id, msg_type_name(msg.msg_type))
-		return false
-	}
+	return client_enqueue_output(client, msg)
 }
 
 @(private)
@@ -88,7 +70,6 @@ broadcast_message :: proc(router: ^Router, msg: ^Output_Msg) -> bool {
 			continue
 		}
 		if client_enqueue_output(client, msg) {
-			fmt.printfln("[Router] Broadcast %s to client %d", msg_type_name(msg.msg_type), client.client_id)
 			success = true
 		}
 	}
@@ -126,7 +107,9 @@ process_queue_batch :: proc(router: ^Router, queue: ^Output_Queue, batch: []Outp
 router_thread_proc :: proc(t: ^thread.Thread) {
 	router := cast(^Router)t.data
 	
-	fmt.println("[Router] Starting")
+	if !router.config.quiet_mode {
+		fmt.println("[Router] Starting")
+	}
 	
 	batch: [ROUTER_BATCH_SIZE]Output_Envelope
 	
@@ -147,7 +130,9 @@ router_thread_proc :: proc(t: ^thread.Thread) {
 	}
 	
 	// Drain remaining
-	fmt.println("[Router] Draining...")
+	if !router.config.quiet_mode {
+		fmt.println("[Router] Draining...")
+	}
 	for iteration := 0; iteration < 100; iteration += 1 {
 		has_messages := false
 		for q: u32 = 0; q < router.num_input_queues; q += 1 {
@@ -165,8 +150,10 @@ router_thread_proc :: proc(t: ^thread.Thread) {
 		}
 	}
 	
-	fmt.println("[Router] Stopped")
-	router_print_stats(router)
+	if !router.config.quiet_mode {
+		fmt.println("[Router] Stopped")
+		router_print_stats(router)
+	}
 }
 
 router_print_stats :: proc(router: ^Router) {

@@ -46,59 +46,92 @@ signal_handler :: proc "c" (sig: i32) {
 	context = runtime.default_context()
 	g_app.shutdown_flag = true
 	g_app.running = false
-	// Close listener socket to unblock accept
 	net.close(g_app.listener.listen_socket)
 }
 
 main :: proc() {
-	fmt.println("╔════════════════════════════════════════╗")
-	fmt.println("║     Odin Matching Engine v1.0          ║")
-	fmt.println("╚════════════════════════════════════════╝")
-	fmt.println("")
+	port, quiet_mode := parse_args()
+	
+	if !quiet_mode {
+		fmt.println("╔════════════════════════════════════════╗")
+		fmt.println("║     Odin Matching Engine v1.0          ║")
+		fmt.println("╚════════════════════════════════════════╝")
+		fmt.println("")
+	}
 	
 	// Install signal handlers
 	libc.signal(libc.SIGINT, signal_handler)
 	libc.signal(libc.SIGTERM, signal_handler)
 	
-	port := parse_port()
-	
-	init_err := app_init(&g_app, port)
+	init_err := app_init(&g_app, port, quiet_mode)
 	if init_err != .None {
 		fmt.eprintfln("Failed to initialize: %s", types.error_string(init_err))
 		os.exit(1)
 	}
 	
-	fmt.printfln("Port:   %d", port)
-	fmt.printfln("Symbol: %s", DEFAULT_SYMBOL)
-	fmt.println("")
+	if !quiet_mode {
+		fmt.printfln("Port:   %d", port)
+		fmt.printfln("Symbol: %s", DEFAULT_SYMBOL)
+		fmt.println("")
+	}
 	
-	start_err := app_start(&g_app)
+	start_err := app_start(&g_app, quiet_mode)
 	if start_err != .None {
 		fmt.eprintfln("Failed to start: %s", types.error_string(start_err))
 		os.exit(1)
 	}
 	
-	fmt.println("Server running. Press Ctrl+C to stop.")
-	fmt.println("")
+	if quiet_mode {
+		fmt.printfln("Odin Matching Engine running on port %d (quiet mode)", port)
+	} else {
+		fmt.println("Server running. Press Ctrl+C to stop.")
+		fmt.println("")
+	}
 	
 	app_wait(&g_app)
-	app_shutdown(&g_app)
+	app_shutdown(&g_app, quiet_mode)
 	
-	fmt.println("Shutdown complete.")
+	if !quiet_mode {
+		fmt.println("Shutdown complete.")
+	}
 }
 
-parse_port :: proc() -> u16 {
+parse_args :: proc() -> (port: u16, quiet: bool) {
+	port = DEFAULT_PORT
+	quiet = false
+	
 	args := os.args
-	if len(args) >= 2 {
-		port, ok := strconv.parse_int(args[1])
-		if ok && port > 0 && port < 65536 {
-			return u16(port)
+	for i := 1; i < len(args); i += 1 {
+		arg := args[i]
+		
+		if arg == "-q" || arg == "--quiet" {
+			quiet = true
+		} else if arg == "-h" || arg == "--help" {
+			fmt.println("Usage: matching_engine [OPTIONS] [PORT]")
+			fmt.println("")
+			fmt.println("Options:")
+			fmt.println("  -q, --quiet    Quiet mode (minimal output)")
+			fmt.println("  -h, --help     Show this help")
+			fmt.println("")
+			fmt.println("Examples:")
+			fmt.println("  matching_engine              # Run on port 1234")
+			fmt.println("  matching_engine 5000         # Run on port 5000")
+			fmt.println("  matching_engine -q           # Quiet mode")
+			fmt.println("  matching_engine -q 5000      # Quiet mode on port 5000")
+			os.exit(0)
+		} else {
+			// Try to parse as port
+			parsed, ok := strconv.parse_int(arg)
+			if ok && parsed > 0 && parsed < 65536 {
+				port = u16(parsed)
+			}
 		}
 	}
-	return DEFAULT_PORT
+	
+	return port, quiet
 }
 
-app_init :: proc(app: ^App, port: u16) -> types.Error {
+app_init :: proc(app: ^App, port: u16, quiet_mode: bool) -> types.Error {
 	app.shutdown_flag = false
 	app.running = false
 	
@@ -113,7 +146,7 @@ app_init :: proc(app: ^App, port: u16) -> types.Error {
 	
 	listener_config := engine.Listener_Config{
 		port       = port,
-		quiet_mode = false,
+		quiet_mode = quiet_mode,
 	}
 	listener_err := engine.listener_init(&app.listener, listener_config, &app.client_registry, &app.shutdown_flag)
 	if listener_err != .None {
@@ -127,14 +160,15 @@ app_init :: proc(app: ^App, port: u16) -> types.Error {
 	engine.processor_init(&app.processor, processor_config, &app.book, &app.client_registry, &app.output_queue, &app.shutdown_flag)
 	
 	router_config := engine.Router_Config{
-		tcp_mode = true,
+		tcp_mode   = true,
+		quiet_mode = quiet_mode,
 	}
 	engine.router_init(&app.router, router_config, &app.client_registry, &app.output_queue, &app.shutdown_flag)
 	
 	return .None
 }
 
-app_start :: proc(app: ^App) -> types.Error {
+app_start :: proc(app: ^App, quiet_mode: bool) -> types.Error {
 	app.listener_thread = thread.create(engine.listener_thread_proc)
 	if app.listener_thread == nil {
 		return .Internal
@@ -159,10 +193,12 @@ app_start :: proc(app: ^App) -> types.Error {
 	
 	app.running = true
 	
-	fmt.println("Threads started:")
-	fmt.println("  ✓ Listener")
-	fmt.println("  ✓ Processor")
-	fmt.println("  ✓ Router")
+	if !quiet_mode {
+		fmt.println("Threads started:")
+		fmt.println("  ✓ Listener")
+		fmt.println("  ✓ Processor")
+		fmt.println("  ✓ Router")
+	}
 	
 	return .None
 }
@@ -173,45 +209,44 @@ app_wait :: proc(app: ^App) {
 	}
 }
 
-app_shutdown :: proc(app: ^App) {
-	fmt.println("")
-	fmt.println("Shutting down...")
+app_shutdown :: proc(app: ^App, quiet_mode: bool) {
+	if !quiet_mode {
+		fmt.println("")
+		fmt.println("Shutting down...")
+	}
 	
-	// Set shutdown flag
 	app.shutdown_flag = true
 	app.running = false
-	
-	// Close listener socket to unblock accept (if not already closed by signal handler)
 	net.close(app.listener.listen_socket)
 	
-	// Give threads time to notice
 	time.sleep(100 * time.Millisecond)
 	
-	// Wait for threads
-	fmt.println("Stopping threads...")
+	if !quiet_mode {
+		fmt.println("Stopping threads...")
+	}
 	
 	if app.processor_thread != nil {
 		thread.join(app.processor_thread)
 		thread.destroy(app.processor_thread)
 		app.processor_thread = nil
-		fmt.println("  ✓ Processor stopped")
 	}
 	
 	if app.router_thread != nil {
 		thread.join(app.router_thread)
 		thread.destroy(app.router_thread)
 		app.router_thread = nil
-		fmt.println("  ✓ Router stopped")
 	}
 	
 	if app.listener_thread != nil {
 		thread.join(app.listener_thread)
 		thread.destroy(app.listener_thread)
 		app.listener_thread = nil
-		fmt.println("  ✓ Listener stopped")
 	}
 	
-	print_final_stats(app)
+	if !quiet_mode {
+		print_final_stats(app)
+	}
+	
 	engine.registry_destroy(&app.client_registry)
 }
 
